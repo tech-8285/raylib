@@ -416,6 +416,10 @@ static SaveFileTextCallback saveFileText = NULL;    // SaveFileText callback fun
 static int screenshotCounter = 0;                   // Screenshots counter
 #endif
 
+// Render texture currently bound by BeginTextureMode(), required to resolve MSAA
+// targets back into their color texture at EndTextureMode()
+static RenderTexture2D currentRenderTexture = { 0 };
+
 #if SUPPORT_AUTOMATION_EVENTS
 // Automation events type
 typedef enum AutomationEventType {
@@ -1007,9 +1011,13 @@ void BeginTextureMode(RenderTexture2D target)
 {
     rlDrawRenderBatchActive();      // Update and draw internal render batch
 
+    currentRenderTexture = target;  // Keep the active target for MSAA resolving at EndTextureMode()
+
     rlEnableFramebuffer(target.id); // Enable render target
 
     // Set viewport and RLGL internal framebuffer size
+    // NOTE: The viewport always matches the target physical pixels, so the whole
+    // output maps to the new target size even after a render size change
     rlViewport(0, 0, target.texture.width, target.texture.height);
     rlSetFramebufferWidth(target.texture.width);
     rlSetFramebufferHeight(target.texture.height);
@@ -1038,10 +1046,30 @@ void EndTextureMode(void)
 {
     rlDrawRenderBatchActive();      // Update and draw internal render batch
 
+#if defined(GRAPHICS_API_OPENGL_33)
+    // Multisampled render textures render into MSAA renderbuffers; resolve them
+    // (averaging samples by coverage) into the regular color texture so the
+    // post-processing stage can sample smooth edge colors like a normal texture.
+    // NOTE: The depth renderbuffer is multisampled too, so occlusion within the
+    // scene already worked correctly during rendering; only color is resolved here.
+    if (rlGetFramebufferSamples(rlGetActiveFramebuffer()) > 0)
+    {
+        rlResolveMSAAFramebuffer(currentRenderTexture.id,
+                                 currentRenderTexture.texture.width, currentRenderTexture.texture.height);
+    }
+#endif
+
     rlDisableFramebuffer();         // Disable render target (fbo)
 
     // Set viewport to default framebuffer size
     SetupViewport(CORE.Window.render.width, CORE.Window.render.height);
+
+    // Reset RLGL internal framebuffer size back to the default framebuffer
+    // NOTE: Without this, the last target size would leak into the window rendering
+    // and into subsequent targets when several differently sized targets are used
+    // in the same frame; each target's clear/draw must only affect its own image
+    rlSetFramebufferWidth(CORE.Window.render.width);
+    rlSetFramebufferHeight(CORE.Window.render.height);
 
     // Go back to the modelview state from BeginDrawing, back to the main framebuffer
     rlMatrixMode(RL_MODELVIEW);     // Switch back to modelview matrix
@@ -4350,6 +4378,11 @@ void SetupViewport(int width, int height)
 
     // Set viewport width and height
     rlViewport(CORE.Window.renderOffset.x/2, CORE.Window.renderOffset.y/2, CORE.Window.render.width, CORE.Window.render.height);
+
+    // Keep RLGL internal framebuffer size in sync, so a render size change maps
+    // the whole output to the new default framebuffer physical pixels
+    rlSetFramebufferWidth(CORE.Window.render.width);
+    rlSetFramebufferHeight(CORE.Window.render.height);
 
     rlMatrixMode(RL_PROJECTION);        // Switch to projection matrix
     rlLoadIdentity();                   // Reset current matrix (projection)

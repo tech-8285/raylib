@@ -775,6 +775,15 @@ RLAPI void rlUnloadFramebuffer(unsigned int id);                          // Del
 RLAPI void rlCopyFramebuffer(int x, int y, int width, int height, int format, void *pixels); // Copy framebuffer pixel data to internal buffer
 RLAPI void rlResizeFramebuffer(int width, int height);                    // Resize internal framebuffer
 
+// Multisampled framebuffer management (MSAA, desktop OpenGL 3.3)
+RLAPI unsigned int rlLoadTextureRenderbufferMSAA(int width, int height, int format, int samples); // Load an MSAA color renderbuffer (to be attached to fbo)
+RLAPI unsigned int rlLoadTextureDepthMSAA(int width, int height, int samples);                    // Load an MSAA depth renderbuffer (to be attached to fbo)
+RLAPI void rlUnloadTextureRenderbuffer(unsigned int id);                                        // Unload a renderbuffer from GPU memory
+RLAPI void rlFramebufferAttachMultisample(unsigned int fboId, int attachType, unsigned int rboId); // Attach a multisampled renderbuffer to a framebuffer object
+RLAPI void rlResolveMSAAFramebuffer(unsigned int fboId, int width, int height); // Resolve a registered MSAA framebuffer into its color texture
+RLAPI void rlSetFramebufferMSAA(unsigned int id, int samples, unsigned int resolveFboId, unsigned int colorRboId, unsigned int depthRboId); // Register a framebuffer as multisampled
+RLAPI int rlGetFramebufferSamples(unsigned int id);                        // Get the MSAA sample count of a framebuffer (0 if not multisampled)
+
 // Shaders management
 RLAPI unsigned int rlLoadShader(const char *code, int type);                    // Load (compile) shader and return shader id (type: RL_VERTEX_SHADER, RL_FRAGMENT_SHADER, RL_COMPUTE_SHADER)
 RLAPI unsigned int rlLoadShaderProgram(const char *vsCode, const char *fsCode); // Load shader from code strings
@@ -1029,6 +1038,17 @@ RLAPI void rlLoadDrawQuad(void);     // Load and draw a quad
 
 typedef void *(*rlglLoadProc)(const char *name);   // OpenGL extension functions loader signature (same as GLADloadproc)
 
+// Multisampled framebuffer registry entry
+// NOTE: A multisampled framebuffer renders into MSAA renderbuffers and is resolved
+// (downsampled) into a regular color texture so it can be sampled as a normal texture
+typedef struct rlFboMSAA {
+    unsigned int fboId;                 // Multisampled framebuffer object id (rendering target)
+    unsigned int resolveFboId;          // Framebuffer with the resolved color texture attached (blit destination)
+    unsigned int colorRboId;            // Multisampled color renderbuffer id
+    unsigned int depthRboId;            // Multisampled depth renderbuffer id
+    int samples;                        // Number of samples used by this framebuffer
+} rlFboMSAA;
+
 typedef struct rlglData {
     rlRenderBatch *currentBatch;            // Current render batch
     rlRenderBatch defaultBatch;             // Default internal render batch
@@ -1079,6 +1099,11 @@ typedef struct rlglData {
 
         int framebufferWidth;               // Current framebuffer width
         int framebufferHeight;              // Current framebuffer height
+
+        // Multisampled (MSAA) render textures registry
+        // NOTE: Each entry maps a framebuffer object id to its multisample configuration
+        struct rlFboMSAA *fboMSAA;          // Dynamic array of multisampled framebuffers
+        int fboMSAACount;                   // Number of registered multisampled framebuffers
 
     } State;            // Renderer state
     struct {
@@ -3923,6 +3948,29 @@ bool rlFramebufferComplete(unsigned int id)
 void rlUnloadFramebuffer(unsigned int id)
 {
 #if (defined(GRAPHICS_API_OPENGL_33) || defined(GRAPHICS_API_OPENGL_ES2) || defined(GRAPHICS_API_OPENGL_SOFTWARE))
+    // If this is a multisampled framebuffer, remove its registry entry, delete the
+    // dedicated resolve framebuffer and the MSAA color renderbuffer.
+    // NOTE: The depth renderbuffer is deleted by the generic attachment-query code
+    // below through target.depth
+#if defined(GRAPHICS_API_OPENGL_33)
+    for (int i = 0; i < RLGL.State.fboMSAACount; i++)
+    {
+        if (RLGL.State.fboMSAA[i].fboId == id)
+        {
+            // Bind the framebuffer so deleting the attached renderbuffer
+            // automatically detaches it (required by the OpenGL specification)
+            glBindFramebuffer(GL_FRAMEBUFFER, id);
+            glDeleteFramebuffers(1, &RLGL.State.fboMSAA[i].resolveFboId);
+            rlUnloadTextureRenderbuffer(RLGL.State.fboMSAA[i].colorRboId);
+
+            // Keep the registry compact by moving the last entry into the gap
+            RLGL.State.fboMSAA[i] = RLGL.State.fboMSAA[RLGL.State.fboMSAACount - 1];
+            RLGL.State.fboMSAACount--;
+            break;
+        }
+    }
+#endif
+
     // Query depth attachment to automatically delete texture/renderbuffer
     int depthType = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, id);   // Bind framebuffer to query depth texture type
@@ -3946,6 +3994,141 @@ void rlUnloadFramebuffer(unsigned int id)
     TRACELOG(RL_LOG_INFO, "FBO: [ID %i] Unloaded framebuffer from VRAM (GPU)", id);
 #endif
 }
+
+#if defined(GRAPHICS_API_OPENGL_33)
+// Register a framebuffer as multisampled, storing its resolve framebuffer and MSAA renderbuffers
+// NOTE: Used to know, at BeginTextureMode()/EndTextureMode() time, how to bind/resolve the target
+void rlSetFramebufferMSAA(unsigned int id, int samples, unsigned int resolveFboId, unsigned int colorRboId, unsigned int depthRboId)
+{
+    rlFboMSAA *entry = NULL;
+
+    // Reuse the entry if the framebuffer was already registered
+    for (int i = 0; i < RLGL.State.fboMSAACount; i++)
+    {
+        if (RLGL.State.fboMSAA[i].fboId == id) { entry = &RLGL.State.fboMSAA[i]; break; }
+    }
+
+    if (entry == NULL)
+    {
+        RLGL.State.fboMSAA = (rlFboMSAA *)RL_REALLOC(RLGL.State.fboMSAA, (RLGL.State.fboMSAACount + 1)*sizeof(rlFboMSAA));
+        entry = &RLGL.State.fboMSAA[RLGL.State.fboMSAACount];
+        RLGL.State.fboMSAACount++;
+    }
+
+    entry->fboId = id;
+    entry->resolveFboId = resolveFboId;
+    entry->colorRboId = colorRboId;
+    entry->depthRboId = depthRboId;
+    entry->samples = samples;
+}
+
+// Get the MSAA sample count of a framebuffer (0 if it is not multisampled)
+int rlGetFramebufferSamples(unsigned int id)
+{
+    int samples = 0;
+
+    for (int i = 0; i < RLGL.State.fboMSAACount; i++)
+    {
+        if (RLGL.State.fboMSAA[i].fboId == id) { samples = RLGL.State.fboMSAA[i].samples; break; }
+    }
+
+    return samples;
+}
+
+// Load a multisampled color renderbuffer (to be attached to a framebuffer)
+// NOTE: The renderbuffer stores one sample per pixel; it is resolved into a regular texture
+unsigned int rlLoadTextureRenderbufferMSAA(int width, int height, int format, int samples)
+{
+    unsigned int id = 0;
+    if (!isGpuReady) { TRACELOG(RL_LOG_WARNING, "GL: GPU is not ready to load data, trying to load before InitWindow()?"); return id; }
+
+    unsigned int glInternalFormat = 0, glFormat = 0, glType = 0;
+    rlGetGlTextureFormats(format, &glInternalFormat, &glFormat, &glType);
+
+    if (glInternalFormat != 0)
+    {
+        glGenRenderbuffers(1, &id);
+        glBindRenderbuffer(GL_RENDERBUFFER, id);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, glInternalFormat, width, height);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+        TRACELOG(RL_LOG_INFO, "TEXTURE: [ID %i] MSAA color renderbuffer loaded successfully (%ix%i, %i samples)", id, width, height, samples);
+    }
+    else TRACELOG(RL_LOG_WARNING, "TEXTURE: MSAA color renderbuffer format not supported");
+
+    return id;
+}
+
+// Load a multisampled depth renderbuffer (to be attached to a framebuffer)
+unsigned int rlLoadTextureDepthMSAA(int width, int height, int samples)
+{
+    unsigned int id = 0;
+    if (!isGpuReady) { TRACELOG(RL_LOG_WARNING, "GL: GPU is not ready to load data, trying to load before InitWindow()?"); return id; }
+
+    glGenRenderbuffers(1, &id);
+    glBindRenderbuffer(GL_RENDERBUFFER, id);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH_COMPONENT24, width, height);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    TRACELOG(RL_LOG_INFO, "TEXTURE: [ID %i] MSAA depth renderbuffer loaded successfully (%ix%i, %i samples)", id, width, height, samples);
+
+    return id;
+}
+
+// Attach a multisampled renderbuffer to a framebuffer object
+void rlFramebufferAttachMultisample(unsigned int fboId, int attachType, unsigned int rboId)
+{
+    glBindFramebuffer(GL_FRAMEBUFFER, fboId);
+
+    if (attachType == RL_ATTACHMENT_DEPTH)
+    {
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rboId);
+    }
+    else
+    {
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + attachType, GL_RENDERBUFFER, rboId);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+// Unload a renderbuffer from GPU memory
+void rlUnloadTextureRenderbuffer(unsigned int id)
+{
+    if (id > 0) glDeleteRenderbuffers(1, &id);
+}
+
+// Resolve a multisampled framebuffer into its regular color texture
+// NOTE: The MSAA renderbuffers hold one value per sample; this blit averages them
+// (with coverage) into a single value per texel, recovering smooth edge colors that
+// can be sampled by the post-processing stage like any ordinary texture.
+// The resolve framebuffer (with the color texture attached) is reused between frames.
+void rlResolveMSAAFramebuffer(unsigned int fboId, int width, int height)
+{
+    rlFboMSAA *entry = NULL;
+    for (int i = 0; i < RLGL.State.fboMSAACount; i++)
+    {
+        if (RLGL.State.fboMSAA[i].fboId == fboId) { entry = &RLGL.State.fboMSAA[i]; break; }
+    }
+    if (entry == NULL)
+    {
+        TRACELOG(RL_LOG_WARNING, "FBO: [ID %i] Tried to resolve an unregistered framebuffer", fboId);
+        return;
+    }
+
+    // The multisampled framebuffer is the read source
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fboId);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    // The resolve framebuffer, with the resolved color texture attached, is the draw destination
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, entry->resolveFboId);
+
+    glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    // Rebind the regular framebuffer target so subsequent state stays consistent
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+#endif
 
 // Vertex data management
 //-----------------------------------------------------------------------------------------

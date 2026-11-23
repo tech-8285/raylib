@@ -4658,6 +4658,93 @@ RLAPI RenderTexture2D LoadRenderTextureEx(int width, int height, int format)
     return target;
 }
 
+// Load RGBA texture for rendering (framebuffer), with multisample anti-aliasing (MSAA)
+// NOTE: The scene is rendered into multisampled color/depth renderbuffers; at EndTextureMode()
+// the color buffer is resolved (downsampled by coverage) into target.texture, a regular texture
+// that the post-processing stage can sample like any ordinary texture.
+// The depth buffer is multisampled as well, so in-scene occlusion still works on the same target.
+RLAPI RenderTexture2D LoadRenderTextureMSAA(int width, int height, int samples)
+{
+    RenderTexture2D target = { 0 };
+
+    // MSAA renderbuffers require desktop OpenGL 3.3 (multisample renderbuffer storage + blit resolve)
+#if defined(GRAPHICS_API_OPENGL_33)
+    if ((width <= 0) || (height <= 0) || (samples <= 0))
+    {
+        TRACELOG(LOG_WARNING, "FBO: Invalid MSAA render texture parameters");
+        return target;
+    }
+
+    target.id = rlLoadFramebuffer(); // Load the multisampled framebuffer (rendering target)
+
+    if (target.id > 0)
+    {
+        rlEnableFramebuffer(target.id);
+
+        // Create the resolved color texture (regular, sampleable texture)
+        target.texture.id = rlLoadTexture(NULL, width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 1);
+        target.texture.width = width;
+        target.texture.height = height;
+        target.texture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        target.texture.mipmaps = 1;
+
+        // Create the multisampled color and depth renderbuffers (rendering targets)
+        unsigned int colorRboId = rlLoadTextureRenderbufferMSAA(width, height, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, samples);
+        unsigned int depthRboId = rlLoadTextureDepthMSAA(width, height, samples);
+
+        // Attach the multisampled renderbuffers to the multisampled framebuffer
+        rlFramebufferAttachMultisample(target.id, RL_ATTACHMENT_COLOR_CHANNEL0, colorRboId);
+        rlFramebufferAttachMultisample(target.id, RL_ATTACHMENT_DEPTH, depthRboId);
+
+        // Expose the multisampled depth renderbuffer through target.depth so
+        // IsRenderTextureValid() succeeds (it is deleted together with the framebuffer)
+        target.depth.id = depthRboId;
+        target.depth.width = width;
+        target.depth.height = height;
+        target.depth.format = 19;       // DEPTH_COMPONENT_24BIT
+        target.depth.mipmaps = 1;
+
+        // Create a second framebuffer that holds the resolved color texture,
+        // used as the blit destination when downsampling the MSAA buffers
+        unsigned int resolveFboId = rlLoadFramebuffer();
+        if (resolveFboId > 0)
+        {
+            rlFramebufferAttach(resolveFboId, target.texture.id, RL_ATTACHMENT_COLOR_CHANNEL0, RL_ATTACHMENT_TEXTURE2D, 0);
+        }
+
+        // Check if fbo is complete with attachments (valid)
+        bool targetComplete = rlFramebufferComplete(target.id);
+        bool resolveComplete = (resolveFboId > 0) && rlFramebufferComplete(resolveFboId);
+        if (targetComplete && resolveComplete)
+        {
+            // Register this framebuffer as multisampled so BeginTextureMode()/EndTextureMode()
+            // know how to bind it and how to resolve it back to target.texture
+            rlSetFramebufferMSAA(target.id, samples, resolveFboId, colorRboId, depthRboId);
+            TRACELOG(LOG_INFO, "FBO: [ID %i] MSAA framebuffer object created successfully (%i samples)", target.id, samples);
+        }
+        else
+        {
+            // Roll back every allocated resource if the target could not be completed
+            TRACELOG(LOG_WARNING, "FBO: MSAA framebuffer object could not be completed");
+            if (resolveFboId > 0) rlUnloadFramebuffer(resolveFboId);
+            rlUnloadTexture(target.texture.id);
+            rlUnloadTextureRenderbuffer(colorRboId); // Color renderbuffer (unregistered, delete explicitly)
+            rlUnloadFramebuffer(target.id);       // Also deletes the depth renderbuffer via target.depth
+            target = (RenderTexture2D){ 0 };
+            return target;
+        }
+
+        rlDisableFramebuffer();
+    }
+    else TRACELOG(LOG_WARNING, "FBO: Framebuffer object can not be created");
+#else
+    TRACELOG(LOG_WARNING, "FBO: MSAA render textures require OpenGL 3.3, falling back to a regular render texture");
+    target = LoadRenderTexture(width, height);
+#endif
+
+    return target;
+}
+
 // Check if texture is valid (loaded in GPU)
 bool IsTextureValid(Texture2D texture)
 {
