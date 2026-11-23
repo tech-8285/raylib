@@ -207,6 +207,10 @@ RLAPI Matrix GetCameraProjectionMatrix(Camera *camera, float aspect);
 // Camera orbital speed in CAMERA_ORBITAL mode
 #define CAMERA_ORBITAL_SPEED                        0.5f       // Radians per second
 
+// Margin kept between the camera target and the clipping planes so the
+// follow point never lands exactly on a plane and gets clipped
+#define CAMERA_CLIP_DISTANCE_EPSILON                0.001f
+
 //----------------------------------------------------------------------------------
 // Types and Structures Definition
 //----------------------------------------------------------------------------------
@@ -246,6 +250,38 @@ Vector3 GetCameraRight(Camera *camera)
 
     return Vector3Normalize(Vector3CrossProduct(forward, up));
 }
+
+#if defined(RCAMERA_STANDALONE)
+// Returns the near clipping distance currently used by the projection
+// NOTE: Standalone builds use a fixed compile-time clipping range
+static inline float GetCameraCullDistanceNear(void)
+{
+    return CAMERA_CULL_DISTANCE_NEAR;
+}
+
+// Returns the far clipping distance currently used by the projection
+// NOTE: Standalone builds use a fixed compile-time clipping range
+static inline float GetCameraCullDistanceFar(void)
+{
+    return CAMERA_CULL_DISTANCE_FAR;
+}
+#else
+// Returns the near clipping distance currently used by the projection
+// NOTE: The clip planes can be reconfigured at runtime through rlSetClipPlanes(),
+// the value is queried every time so the camera reachable positions follow the change
+static inline float GetCameraCullDistanceNear(void)
+{
+    return rlGetCullDistanceNear();
+}
+
+// Returns the far clipping distance currently used by the projection
+// NOTE: The clip planes can be reconfigured at runtime through rlSetClipPlanes(),
+// the value is queried every time so the camera reachable positions follow the change
+static inline float GetCameraCullDistanceFar(void)
+{
+    return rlGetCullDistanceFar();
+}
+#endif
 
 // Moves the camera in its forward direction
 void CameraMoveForward(Camera *camera, float distance, bool moveInWorldPlane)
@@ -314,8 +350,18 @@ void CameraMoveToTarget(Camera *camera, float delta)
     // Apply delta
     distance += delta;
 
-    // Distance must be greater than 0
-    if (distance <= 0) distance = 0.001f;
+    // Clamp the camera-target distance to the visible depth range so the
+    // follow point (target) always stays between the near and far planes.
+    // The values are queried at call time, so adjusting the clip planes at
+    // runtime immediately updates the camera reachable positions.
+    float minDistance = GetCameraCullDistanceNear() + CAMERA_CLIP_DISTANCE_EPSILON;
+    float maxDistance = GetCameraCullDistanceFar() - CAMERA_CLIP_DISTANCE_EPSILON;
+
+    // Guard against inverted or extremely tight clip ranges
+    if (maxDistance < minDistance) maxDistance = minDistance;
+
+    if (distance < minDistance) distance = minDistance;
+    else if (distance > maxDistance) distance = maxDistance;
 
     // Set new distance by moving the position along the forward vector
     Vector3 forward = GetCameraForward(camera);
@@ -382,6 +428,25 @@ void CameraPitch(Camera *camera, float angle, bool lockView, bool rotateAroundTa
     // Rotation axis
     Vector3 right = GetCameraRight(camera);
 
+    // Near the pitch limits the view vector becomes parallel to the up vector
+    // and the cross product defining the right axis collapses to zero, which
+    // makes its direction numerically unstable and the view jump/swing at the
+    // poles. Fall back to a stable axis perpendicular to the up vector so the
+    // pitch stays continuous and the camera remains upright (no roll).
+    // The lockView clamp can still leave the axis 0.001 rad from the pole, so
+    // the threshold is set well above that residual length.
+    if ((right.x*right.x + right.y*right.y + right.z*right.z) < 0.0001f)
+    {
+        // Pick a world axis not aligned with the camera up as a reference
+        Vector3 reference = { 1.0f, 0.0f, 0.0f };
+        if (fabsf(Vector3DotProduct(up, reference)) > 0.99f) reference = (Vector3){ 0.0f, 0.0f, 1.0f };
+
+        // Project the reference onto the plane perpendicular to up and negate
+        // it to match the GetCameraRight() convention: right = forward x up
+        Vector3 projected = Vector3Subtract(reference, Vector3Scale(up, Vector3DotProduct(up, reference)));
+        right = Vector3Normalize(Vector3Negate(projected));
+    }
+
     // Rotate view vector around right axis
     targetPosition = Vector3RotateByAxisAngle(targetPosition, right, angle);
 
@@ -426,14 +491,14 @@ Matrix GetCameraProjectionMatrix(Camera *camera, float aspect)
 {
     if (camera->projection == CAMERA_PERSPECTIVE)
     {
-        return MatrixPerspective(camera->fovy*DEG2RAD, aspect, CAMERA_CULL_DISTANCE_NEAR, CAMERA_CULL_DISTANCE_FAR);
+        return MatrixPerspective(camera->fovy*DEG2RAD, aspect, GetCameraCullDistanceNear(), GetCameraCullDistanceFar());
     }
     else if (camera->projection == CAMERA_ORTHOGRAPHIC)
     {
         float top = camera->fovy/2.0f;
         float right = top*aspect;
 
-        return MatrixOrtho(-right, right, -top, top, CAMERA_CULL_DISTANCE_NEAR, CAMERA_CULL_DISTANCE_FAR);
+        return MatrixOrtho(-right, right, -top, top, GetCameraCullDistanceNear(), GetCameraCullDistanceFar());
     }
 
     return MatrixIdentity();
